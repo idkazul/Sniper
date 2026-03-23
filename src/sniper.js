@@ -4,27 +4,30 @@ const axios = require("axios");
 
 // ===== CONFIG =====
 const CONFIG = {
-    maxServersPerPage: 100,
     batchSize: 100,
-    requestDelay: 350, // ms between requests (safe)
-    maxRetries: 3,
-    concurrentPageRequests: 2
+    requestDelay: 350,
+    maxRetries: 3
 };
 
 // ===== UTIL =====
 const delay = (ms) => new Promise(res => setTimeout(res, ms));
 
-// ===== ROBLOX API WRAPPERS =====
+// Extract unique CDN hash
+function extractHash(url) {
+    if (!url) return null;
+    const match = url.match(/rbxcdn\.com\/([^/]+)/);
+    return match ? match[1] : null;
+}
+
+// ===== API =====
 async function fetchServers(placeId, cursor = null) {
     const url = `https://games.roblox.com/v1/games/${placeId}/servers/Public?limit=100${cursor ? `&cursor=${cursor}` : ""}`;
-
     const res = await axios.get(url);
     return res.data;
 }
 
 async function fetchAvatar(userId) {
     const url = `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${userId}&size=150x150&format=Png`;
-
     const res = await axios.get(url);
     return res.data.data[0]?.imageUrl;
 }
@@ -48,7 +51,7 @@ async function fetchThumbnails(tokens) {
     return res.data.data;
 }
 
-// ===== RETRY WRAPPER =====
+// ===== RETRY =====
 async function safeRequest(fn, retries = CONFIG.maxRetries) {
     for (let i = 0; i < retries; i++) {
         try {
@@ -60,96 +63,110 @@ async function safeRequest(fn, retries = CONFIG.maxRetries) {
     }
 }
 
-// ===== CORE MATCHING =====
-async function processTokens(tokenEntries, targetImage) {
+// ===== MATCHING =====
+async function processTokens(tokenEntries, targetHash) {
+    let checked = 0;
+
     for (let i = 0; i < tokenEntries.length; i += CONFIG.batchSize) {
         const batch = tokenEntries.slice(i, i + CONFIG.batchSize);
-
-        const tokens = batch.map(entry => entry.token);
+        const tokens = batch.map(e => e.token);
 
         const thumbnails = await safeRequest(() => fetchThumbnails(tokens));
 
         for (let j = 0; j < thumbnails.length; j++) {
             const thumb = thumbnails[j];
+            checked++;
 
             if (!thumb || !thumb.imageUrl) continue;
 
-            if (thumb.imageUrl === targetImage) {
-                return batch[j]; // MATCH FOUND
+            const thumbHash = extractHash(thumb.imageUrl);
+
+            // 🔥 MAIN MATCH
+            if (thumbHash && thumbHash === targetHash) {
+                return { match: batch[j], checked };
+            }
+
+            // ⚠️ FALLBACK (looser match)
+            if (thumb.imageUrl && thumb.imageUrl.includes(targetHash)) {
+                return { match: batch[j], checked };
             }
         }
 
         await delay(CONFIG.requestDelay);
     }
 
-    return null;
+    return { match: null, checked };
 }
 
-// ===== MAIN FUNCTION =====
+// ===== MAIN =====
 async function findPlayer(placeId, userId) {
     let cursor = null;
-    let found = null;
+    let pageCount = 0;
+    let totalTokens = 0;
 
-    // Step 1: Get target avatar
     const targetImage = await safeRequest(() => fetchAvatar(userId));
+    const targetHash = extractHash(targetImage);
 
-    if (!targetImage) {
-        return { success: false, error: "Avatar fetch failed" };
+    if (!targetImage || !targetHash) {
+        return {
+            success: false,
+            error: "Avatar fetch failed"
+        };
     }
 
-    let pageCount = 0;
-
     do {
-        const pageData = await safeRequest(() => fetchServers(placeId, cursor));
+        const page = await safeRequest(() => fetchServers(placeId, cursor));
 
-        if (!pageData || !pageData.data) break;
+        if (!page || !page.data) break;
 
-        cursor = pageData.nextPageCursor;
+        cursor = page.nextPageCursor;
         pageCount++;
 
         let tokenEntries = [];
 
-        // Collect tokens
-        for (const server of pageData.data) {
+        for (const server of page.data) {
             if (!server.playerTokens) continue;
 
             for (const token of server.playerTokens) {
                 tokenEntries.push({
-                    token: token,
+                    token,
                     jobId: server.id,
-                    placeId: placeId
+                    placeId
                 });
             }
         }
 
-        // Step 2: Match tokens
-        const match = await processTokens(tokenEntries, targetImage);
+        totalTokens += tokenEntries.length;
+
+        console.log(`[SCAN] Page ${pageCount} → Tokens: ${tokenEntries.length}`);
+
+        const { match, checked } = await processTokens(tokenEntries, targetHash);
 
         if (match) {
-            // 🔁 Double-check (accuracy boost)
-            const confirm = await processTokens([match], targetImage);
+            console.log(`[FOUND] Match after checking ${checked} tokens`);
 
-            if (confirm) {
-                found = match;
-                break;
-            }
+            return {
+                success: true,
+                jobId: match.jobId,
+                placeId: match.placeId,
+                debug: {
+                    serversScanned: pageCount,
+                    tokensChecked: totalTokens
+                }
+            };
         }
 
         await delay(CONFIG.requestDelay);
 
     } while (cursor);
 
-    if (found) {
-        return {
-            success: true,
-            jobId: found.jobId,
-            placeId: found.placeId
-        };
-    }
-
     return {
         success: false,
-        error: "Player not found"
+        error: "Player not found",
+        debug: {
+            serversScanned: pageCount,
+            tokensChecked: totalTokens
+        }
     };
 }
 
