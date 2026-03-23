@@ -1,16 +1,18 @@
+// src/index.js
+
 const express = require("express");
-const { findPlayer } = require("./sniper");
+const { createJob, getJob } = require("./jobManager");
 
 const app = express();
 app.use(express.json());
 
-// Basic health check
+// ===== HEALTH CHECK =====
 app.get("/", (req, res) => {
     res.send("Sniper API is running");
 });
 
-// MAIN ENDPOINT
-app.get("/snipe", async (req, res) => {
+// ===== START SNIPER JOB =====
+app.get("/snipe", (req, res) => {
     const { placeId, userId } = req.query;
 
     if (!placeId || !userId) {
@@ -20,28 +22,56 @@ app.get("/snipe", async (req, res) => {
         });
     }
 
+    console.log(`[NEW JOB] placeId=${placeId} userId=${userId}`);
+
     try {
-        console.log(`[REQUEST] placeId=${placeId} userId=${userId}`);
+        const jobId = createJob(placeId, userId);
 
-        const result = await findPlayer(placeId, userId);
-
-        console.log(`[RESULT]`, result);
-
-        res.json(result);
+        return res.json({
+            success: true,
+            jobId: jobId
+        });
 
     } catch (err) {
-        console.error("[ERROR]", err);
+        console.error("[ERROR CREATING JOB]", err);
 
-        res.status(500).json({
+        return res.status(500).json({
             success: false,
-            error: "Internal server error"
+            error: "Failed to create job"
         });
     }
 });
 
-// Start server
+// ===== CHECK JOB STATUS =====
+app.get("/status", (req, res) => {
+    const { id } = req.query;
+
+    if (!id) {
+        return res.status(400).json({
+            success: false,
+            error: "Missing job ID"
+        });
+    }
+
+    const job = getJob(id);
+
+    if (!job) {
+        return res.status(404).json({
+            success: false,
+            error: "Job not found"
+        });
+    }
+
+    return res.json({
+        success: true,
+        status: job.status,   // pending | running | completed | failed
+        result: job.result
+    });
+});
+
+// ===== START SERVER =====
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Sniper API running on port ${PORT}`);
 });
